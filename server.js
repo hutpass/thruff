@@ -1,69 +1,83 @@
+#!/usr/bin/env node
+
 var https = require('https');
 var http = require('http');
 var crypto = require('crypto');
-var redis = require('redis');
-var cfg = require('envigor')();
+var msgpack = require('msgpack');
 
-var db = redis.createClient(cfg.redis.port, cfg.redis.hostname,
-  {no_ready_check: true});
-if (cfg.redis.password) db.auth(cfg.redis.password);
+var domains = Object.create(null);
+
+function getDomain(domain) {
+  // return any credentials for this domain itself
+  if (domains[domain]) return domains[domain];
+
+  var components = domain.split('.');
+
+  // We go to length - 1 because nobody's going to own the TLD
+  // There may be other public suffixes we'll disallow, but this one
+  // we can 100% not do
+  for (var i = 1; i < components.length - 1; i++) {
+    var wildDomain = '*.' + components.slice(i).join('.');
+    // return any wildcard credentials for a higher-level domain
+    if (domains[wildDomain]) return domains[wildDomain];
+  }
+
+  return null;
+}
+
+function getCredentials(domain) {
+  var record = getDomain(domain);
+  return record && record.credentials;
+}
+
+function getTarget(domain) {
+  var record = getDomain(domain);
+  return record && record.target;
+}
+
+function updateDomains(message) {
+  // there should really only be one domain per message but
+  var msgDomains = Object.keys(message);
+  // For the domain(s) in the message
+  for (var i = 0; i < msgDomains.length; i++) {
+    var domain = msgDomains[i];
+    // If there's content in the message for this domain
+    if (message[domain]) {
+      // Create any new domain
+      if (!domains[domain]) domains[domain] = {};
+      // Update any target
+      if (message[domain].target)
+        domains[domain].target = message[domain].target;
+      // Create credentials for any key + cert pairs
+      if (message[domain].key && message[domain].cert)
+        domains[domain].credentials = crypto.createCredentials({
+          key: message[domain].key,
+          cert: message[domain].cert
+        });
+    // Delete any keys that are nulled in the message
+    } else {
+      delete domains[msgDomains[i]];
+    }
+  }
+}
+
+process.stdin.resume();
+
+var msgstream = new msgpack.Stream(process.stdin);
+
+msgstream.addListener('msg', updateDomains);
 
 var serverOpts = {
   // handshakeTimeout by default is 120 seconds which sounds WAY too high
   //handshakeTimeout: 20000,
   // mitigate BEAST attacks by preferring non-vulerable ciphers
-  honorCipherOrder: true
+  honorCipherOrder: true,
+  SNICallback: getCredentials
 };
 
 var proxy = require('http-proxy').createProxyServer({
   xfwd: true, secure: false
 });
-
-// WAIT THIS HAS TO RETURN SYNCHRONOUSLY OH NUTS
-function getSecureContext(domain, cb) {
-  var keys = ['key:' + domain,'cert:'+ domain];
-  var components = domain.split('.');
-
-  // We go to length - 1 because nobody's going to own the TLD
-  // There may be other public suffixes we'll disallow, but this one
-  // we can 100% not do
-  for (var i=1; i < components.length - 1; i++) {
-    var wildDomain = components.slice(i).join('.');
-    keys[i*2] = 'key:*.'+wildDomain;
-    keys[i*2 + 1] = 'cert:*.'+wildDomain;
-  }
-  db.mget(keys,function(err, creds) {
-    if (err) return cb(err);
-    for (var i = 0; i < keys.length; i+=2) {
-      if (creds[i]) {
-        return cb(null,crypto.createCredentials({
-          key: creds[i],
-          cert: creds[i+1]
-        }));
-      }
-    }
-    return cb(null, null);
-  });
-}
-
-function getTarget(domain, cb) {
-  var keys = ['target:' + domain];
-  var components = domain.split('.');
-
-  // We go to length - 1 because nobody's going to own the TLD
-  // There may be other public suffixes we'll disallow, but this one
-  // we can 100% not do
-  for (var i=1; i < components.length - 1; i++) {
-    keys[i] = 'target:*.'+components.slice(i).join('.');
-  }
-  db.mget(keys,function(err, targets) {
-    if (err) return cb(err);
-    for (var i = 0; i < keys.length; i++) {
-      if (targets[i]) return cb(null,targets[i]);
-    }
-    return cb(null, null);
-  });
-}
 
 function respondError(err, req, res){
   res.statusCode = 500;
@@ -77,16 +91,15 @@ function respondNotFound(req, res){
 }
 
 function forwardRequest(req, res) {
-  getTarget(req.headers.host, function(err, target) {
-    if (err) return respondError(err, req, res);
-    if (target) return proxy.web(req, res, {target:target});
-    else return respondNotFound(req, res);
-  });
+  var target = getTarget(req.headers.host);
+  if (target) return proxy.web(req, res, {target:target});
+  else return respondNotFound(req, res);
 }
 
 function redirectToHttps(req, res) {
   var host = req.headers.host;
-  if (host) {
+  // If they're asking for a name we're proxying
+  if (host && getTarget(host)) {
     res.statusCode = 301;
     res.setHeader('Location', 'https://' + host + req.url);
     res.end();
@@ -96,5 +109,5 @@ function redirectToHttps(req, res) {
   }
 }
 
-https.createServer(serverOpts,forwardRequest);
-http.createServer(serverOpts,redirectToHttps).listen(80);
+https.createServer(serverOpts, forwardRequest).listen(443);
+http.createServer(serverOpts, redirectToHttps).listen(80);

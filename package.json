@@ -16,9 +16,7 @@
     "url": "https://github.com/hutpass/thruff/issues"
   },
   "dependencies": {
-    "envigor": "~0.5.1",
-    "redis": "~0.10.0",
     "http-proxy": "~1.0.2",
-    "hiredis": "~0.1.16"
+    "msgpack": "~0.2.1"
   }
 }
