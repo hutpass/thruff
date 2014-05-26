@@ -22,6 +22,8 @@ function getDomain(domain) {
     if (domains[wildDomain]) return domains[wildDomain];
   }
 
+  // If we tried the domain and any possible wildcards and got no success,
+  // we didn't find a record
   return null;
 }
 
@@ -40,35 +42,74 @@ function getRedirect(domain) {
   return record && record.redirect;
 }
 
+function processSelfUpdate(update) {
+  // If the update content is not null
+  if (update) {
+
+    // (Re)start the HTTPS server when we get a key and cert
+    if (update.key && update.cert) {
+      serverOpts.key = update.key;
+      serverOpts.cert = update.cert;
+      startHttpsServer();
+    }
+
+    // Self updates only test for HTTPS server credentials
+    // and ignore target / redirect records
+
+  // If the update content is null
+  } else {
+    // Stop the HTTPS server and clear the credentials
+    stopHttpsServer();
+    delete serverOpts.key;
+    delete serverOpts.cert;
+  }
+}
+
+function processDomainUpdate(domain, update) {
+  // If the update content is not null
+  if (update) {
+    // Create any new domain
+    if (!domains[domain]) domains[domain] = {};
+
+    // Update any target
+    if (update.target) {
+      domains[domain].target = message[domain].target;
+      delete domains[domain].redirect;
+    }
+    // If not target but redirect, set redirect instead
+    else if (update.redirect) {
+      domains[domain].redirect = message[domain].redirect;
+      delete domains[domain].target;
+    }
+
+    // Create credentials for any key + cert pairs
+    if (update.key && update.cert)
+      domains[domain].credentials = crypto.createCredentials({
+        key: update.key, cert: update.cert
+      });
+
+  // If the update content is null
+  } else {
+    // Delete the domain record
+    delete domains[domain];
+  }
+}
+
 function updateDomains(message) {
   // there should really only be one domain per message but
   var msgDomains = Object.keys(message);
   // For the domain(s) in the message
   for (var i = 0; i < msgDomains.length; i++) {
     var domain = msgDomains[i];
-    // If there's content in the message for this domain
-    if (message[domain]) {
-      // Create any new domain
-      if (!domains[domain]) domains[domain] = {};
-      // Update any target
-      if (message[domain].target) {
-        domains[domain].target = message[domain].target;
-        delete domains[domain].redirect;
-      }
-      // If not target but redirect, set redirect instead
-      else if (message[domain].redirect) {
-        domains[domain].redirect = message[domain].redirect;
-        delete domains[domain].target;
-      }
-      // Create credentials for any key + cert pairs
-      if (message[domain].key && message[domain].cert)
-        domains[domain].credentials = crypto.createCredentials({
-          key: message[domain].key,
-          cert: message[domain].cert
-        });
-    // Delete any keys that are nulled in the message
+
+    // If this is a self-content message
+    if (domain == '@') {
+      // process it as such
+      processSelfUpdate(message[domain]);
+    // Otherwise
     } else {
-      delete domains[msgDomains[i]];
+      // Process content for the domain
+      processDomainUpdate(message[domain]);
     }
   }
 }
@@ -82,7 +123,7 @@ msgstream.addListener('msg', updateDomains);
 var serverOpts = {
   // handshakeTimeout by default is 120 seconds which sounds WAY too high
   //handshakeTimeout: 20000,
-  // mitigate BEAST attacks by preferring non-vulerable ciphers
+  // mitigate BEAST attacks by preferring non-vulnerable ciphers
   honorCipherOrder: true,
   SNICallback: getCredentials
 };
@@ -127,5 +168,15 @@ function redirectToHttps(req, res) {
   }
 }
 
-https.createServer(serverOpts, forwardRequest).listen(443);
-http.createServer(serverOpts, redirectToHttps).listen(80);
+http.createServer(redirectToHttps).listen(80);
+
+var httpsServer = null;
+
+function stopHttpsServer(cb) {
+  httpsServer.close(function(){httpsServer = null; cb && cb()});
+}
+
+function startHttpsServer(cb) {
+  if (httpsServer) stopHttpsServer(startHttpsServer.bind(null,cb));
+  httpsServer = https.createServer(serverOpts, forwardRequest).listen(443,cb);
+}
